@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """Builds assets/glitch-{dark,light}.svg: the profile's contribution graph,
-drawn from live GitHub data in GitHub's exact style. It glitches, collapses,
+drawn in GitHub's exact style from a synthetic (non-revealing) calendar. It glitches, collapses,
 and its own squares reassemble into the owner's name before snapping back.
 Pure CSS animation, no JS, so it survives GitHub's image proxy.
 
-Usage: python generate.py [login]   (token: $GH_TOKEN, $GITHUB_TOKEN or `gh auth token`)
+Usage: python generate.py [login]
 """
-import json
 import math
 import os
 import random
-import subprocess
 import sys
-import urllib.request
-from datetime import date, datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 LOGIN = os.environ.get("LOGIN") or (sys.argv[1] if len(sys.argv) > 1 else "VYefimenko")
 T = 16.0          # full cycle, seconds
@@ -30,7 +27,6 @@ THEMES = {
     "light": dict(fg="#1f2328", muted="#59636e", border="#d1d9e0", cell_border="#1f23280d",
                   cells=["#eff2f5", "#aceebb", "#4ac26b", "#2da44e", "#116329"], danger="#d1242f"),
 }
-LEVELS = {"NONE": 0, "FIRST_QUARTILE": 1, "SECOND_QUARTILE": 2, "THIRD_QUARTILE": 3, "FOURTH_QUARTILE": 4}
 
 # Geometry measured from the live profile page.
 GRID_X, GRID_Y, PITCH, CELL = 69, 73, 15, 11
@@ -55,24 +51,28 @@ GLYPHS = {
 NAME_PITCH, NAME_Y = 13, 46
 
 
-def token():
-    t = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    return t or subprocess.check_output(["gh", "auth", "token"], text=True).strip()
-
-
 def fetch():
-    q = ('{user(login:"%s"){contributionsCollection{contributionCalendar{totalContributions '
-         'weeks{contributionDays{date contributionLevel}}}}}}' % LOGIN)
-    req = urllib.request.Request(
-        "https://api.github.com/graphql", data=json.dumps({"query": q}).encode(),
-        headers={"Authorization": "bearer " + token(), "Content-Type": "application/json"})
-    cal = json.load(urllib.request.urlopen(req))["data"]["user"]["contributionsCollection"]["contributionCalendar"]
-    days = []
-    for col, week in enumerate(cal["weeks"]):
-        for d in week["contributionDays"]:
-            dt = date.fromisoformat(d["date"])
-            days.append((col, (dt.weekday() + 1) % 7, dt, LEVELS[d["contributionLevel"]]))
-    return cal["totalContributions"], days
+    """Synthetic calendar in GitHub's shape (53 weeks ending today). Each day's
+    value is seeded by its date, so the graph shifts day by day instead of
+    reshuffling. Returns (total, [(col, row, date, level)], {date: count})."""
+    today = datetime.now(timezone.utc).date()
+    start = today - timedelta(days=365)
+    start -= timedelta(days=(start.weekday() + 1) % 7)  # back to Sunday
+    counts = {}
+    d = start
+    while d <= today:
+        iso = d.isocalendar()
+        mood = random.Random(f"{LOGIN}-w{iso[0]}-{iso[1]}").choice([.05, .35, .6, .8, .9, .9, 1, 1])
+        rd = random.Random(f"{LOGIN}-{d}")
+        active = rd.random() < mood * (.92 if d.weekday() < 5 else .38)
+        counts[d] = min(int(rd.expovariate(1 / (1 + 5 * mood))) + 1, 31) if active else 0
+        d += timedelta(days=1)
+    # GitHub's levels are quartiles of the non-zero days.
+    nz = sorted(v for v in counts.values() if v)
+    q = [nz[len(nz) * k // 4] for k in (1, 2, 3)] if nz else [1, 1, 1]
+    days = [((dt - start).days // 7, (dt.weekday() + 1) % 7, dt, 0 if not v else 1 + sum(v >= t for t in q))
+            for dt, v in counts.items()]
+    return sum(counts.values()), days, counts
 
 
 def name_pixels(text):
@@ -207,14 +207,14 @@ def build(theme, total, days, synced):
     o(f'<rect x="34" y="12" width="180" height="20" fill="{NIGHT}" {A.add(typing, steps=True)}/>')
     fade1 = A.add([(0, "opacity:0"), (9.0, "opacity:0"), (9.5, "opacity:1"), (T, "opacity:1")])
     fade2 = A.add([(0, "opacity:0"), (9.6, "opacity:0"), (10.1, "opacity:1"), (T, "opacity:1")])
-    o(f'<text x="36" y="170" font-size="13" font-family="{MONO}" fill="#8b8b99" {fade1}>every square here is a real commit.</text>')
+    o(f'<text x="36" y="170" font-size="13" font-family="{MONO}" fill="#8b8b99" {fade1}>every square here is a commit.</text>')
     o(f'<text x="36" y="189" font-size="13" font-family="{MONO}" fill="#8b8b99" {fade2}>they just don\'t like being '
       f'<tspan fill="{RED}">watched.</tspan></text>')
     for k in range(5):
         o(f'<text x="36" y="209" font-size="11" font-family="{MONO}" fill="#55556a" '
           f'{A.windows([(10.2 + k, 11.2 + k if k < 4 else 15.2)])}>[0x539] reassembling in {5 - k}…</text>')
     o(f'<text x="{W - 36}" y="209" font-size="11" font-family="{MONO}" fill="#55556a" text-anchor="end" {fade2}>'
-      f'{total:,} real contributions · synced {synced}</text>')
+      f'{total:,} contributions · synced {synced}</text>')
     o("</g>")
 
     # ---------- the graph ----------
@@ -235,12 +235,12 @@ def build(theme, total, days, synced):
     jitter.append((T, "transform:translate(0,0)"))
     o(f'<g {A.add(jitter, steps=True)}>')
 
-    # Heading: real count, then it spins up to 999,999,999 with corrupt flashes.
+    # Heading: the count, then it spins up to 999,999,999 with corrupt flashes.
     head = f'<g class="fx" {A.fall(6.1, rnd, heavy=True)}>'
-    real = max(total, 1)
+    base = max(total, 1)
     head += f'<text x="0" y="17" font-size="16" fill="{c["fg"]}" {A.windows([(0, 3.5), (15.6, T)])}>{fmt(total)}</text>'
     for i in range(1, 10):
-        v, a = int(real * (999_999_999 / real) ** (i / 10)), 3.4 + i * .1
+        v, a = int(base * (999_999_999 / base) ** (i / 10)), 3.4 + i * .1
         head += f'<text x="0" y="17" font-size="16" fill="{c["fg"]}" {A.windows([(a, a + .1)])}>{fmt(v)}</text>'
     big = fmt(999_999_999)
     head += f'<text x="0" y="17" font-size="16" fill="{c["fg"]}" {A.windows([(4.4, 4.72), (4.82, 5.0), (5.06, 15.6)])}>{big}</text>'
@@ -351,7 +351,7 @@ def build(theme, total, days, synced):
 
 
 def main():
-    total, days = fetch()
+    total, days, _ = fetch()
     synced = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     os.makedirs("assets", exist_ok=True)
     for theme in THEMES:
